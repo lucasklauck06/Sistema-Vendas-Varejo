@@ -50,6 +50,11 @@ def limpar_cache():
     r.flushdb()
     print("🧹 Cache do Redis foi limpo.")
 
+
+def limpar_dados_redis():
+    """Alias para `limpar_cache` com nome mais explícito."""
+    limpar_cache()
+
 # --- MENU DE TESTE ---
 def menu_redis():
     while True:

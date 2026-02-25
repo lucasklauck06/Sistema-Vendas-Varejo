@@ -23,10 +23,23 @@ def gerar_recomendacoes_redis():
     print("\n--- Clientes Disponíveis (PostgreSQL) ---")
     conn_listagem = db_postgres.conectar()
     if conn_listagem:
-        db_postgres.listar_clientes(conn_listagem)
-        conn_listagem.close()
+        try:
+            cur = conn_listagem.cursor()
+            cur.execute("SELECT COUNT(*) FROM Clientes;")
+            total = cur.fetchone()[0]
+            if not total:
+                print("Nenhum cliente encontrado. Não é possível gerar recomendações.")
+                conn_listagem.close()
+                return
+            # Se há clientes, mostra a lista (função existente)
+            db_postgres.listar_clientes(conn_listagem)
+        except Exception as e:
+            print(f"Erro ao verificar clientes: {e}")
+        finally:
+            conn_listagem.close()
     else:
         print("(Não foi possível conectar ao Postgres para listar clientes)")
+        return
     # --------------------------------------------------------
 
     cpf_alvo = input("Digite o CPF do usuário para gerar recomendações: ")
@@ -127,23 +140,40 @@ def fluxo_compra_integrada():
 
         # [PASSO 1] Identificação do Cliente
         print("\n--- [1] Identificação do Cliente ---")
-        db_postgres.listar_clientes(conn_pg)
-        entrada_cliente = input("Digite o ID do Cliente (ou 'N' para cadastrar novo): ")
+
+        # Verifica se há clientes cadastrados; se não, oferece cadastrar ou sair
+        try:
+            cursor.execute("SELECT COUNT(*) FROM Clientes;")
+            total_clientes = cursor.fetchone()[0]
+        except Exception as e:
+            print(f"Erro ao verificar clientes: {e}")
+            return
 
         id_cliente = None
-        
-        if entrada_cliente.upper() == 'N':
-            id_cliente = db_postgres.criar_cliente(conn_pg)
-            if not id_cliente: return
+        if total_clientes == 0:
+            escolha = input("Nenhum cliente encontrado. Deseja cadastrar agora? (S/N): ").strip().upper()
+            if escolha == 'S':
+                id_cliente = db_postgres.criar_cliente(conn_pg)
+                if not id_cliente: return
+            else:
+                print("Operação cancelada.")
+                return
         else:
-            id_cliente = entrada_cliente
-            cursor.execute("SELECT id FROM Clientes WHERE id = %s", (id_cliente,))
-            if not cursor.fetchone():
-                print(f"⚠️ Cliente {id_cliente} não encontrado.")
-                if input("Cadastrar agora? (S/N): ").upper() == 'S':
-                     id_cliente = db_postgres.criar_cliente(conn_pg)
-                     if not id_cliente: return
-                else: return
+            db_postgres.listar_clientes(conn_pg)
+            entrada_cliente = input("Digite o ID do Cliente (ou 'N' para cadastrar novo): ")
+
+            if entrada_cliente.upper() == 'N':
+                id_cliente = db_postgres.criar_cliente(conn_pg)
+                if not id_cliente: return
+            else:
+                id_cliente = entrada_cliente
+                cursor.execute("SELECT id FROM Clientes WHERE id = %s", (id_cliente,))
+                if not cursor.fetchone():
+                    print(f"⚠️ Cliente {id_cliente} não encontrado.")
+                    if input("Cadastrar agora? (S/N): ").upper() == 'S':
+                        id_cliente = db_postgres.criar_cliente(conn_pg)
+                        if not id_cliente: return
+                    else: return
 
         # Pega nome atualizado
         cursor.execute("SELECT cpf, nome FROM Clientes WHERE id = %s", (id_cliente,))
@@ -152,37 +182,63 @@ def fluxo_compra_integrada():
 
         # [PASSO 2] Seleção do Produto
         print("\n--- [2] Seleção do Produto ---")
-        db_postgres.listar_produtos(conn_pg)
-        entrada_prod = input("Digite o ID do Produto (ou 'N' para novo): ")
-        
-        id_produto = None
-        if entrada_prod.upper() == 'N':
-            id_produto = db_postgres.criar_produto(conn_pg)
-        else:
-            id_produto = entrada_prod
-            cursor.execute("SELECT id FROM Produtos WHERE id = %s", (id_produto,))
-            if not cursor.fetchone():
-                 if input("Produto não existe. Cadastrar? (S/N): ").upper() == 'S':
-                     id_produto = db_postgres.criar_produto(conn_pg)
-                 else: return
 
-        if not id_produto: return
+        compras_pendente = []  # lista de (id_produto, quantidade)
 
-        # =========================================================
-        # [PASSO 3] GRAVAÇÃO NO POSTGRES (AGORA COM ESTOQUE)
-        # =========================================================
-        
-        # 1. Tenta baixar o estoque primeiro
-        if db_postgres.decrementar_estoque(conn_pg, id_produto):
-            
-            # 2. Se deu certo, registra a compra
-            cursor.execute("INSERT INTO Compras (id_cliente, id_produto) VALUES (%s, %s)", (id_cliente, id_produto))
-            conn_pg.commit() # Salva TANTO o update de estoque QUANTO o insert da compra
+        while True:
+            db_postgres.listar_produtos(conn_pg)
+            entrada_prod = input("Digite o ID do Produto (ou 'N' para novo): ")
+
+            if entrada_prod.upper() == 'N':
+                id_produto = db_postgres.criar_produto(conn_pg)
+                if not id_produto:
+                    continue
+            else:
+                id_produto = entrada_prod
+                cursor.execute("SELECT id FROM Produtos WHERE id = %s", (id_produto,))
+                if not cursor.fetchone():
+                    if input("Produto não existe. Cadastrar? (S/N): ").upper() == 'S':
+                        id_produto = db_postgres.criar_produto(conn_pg)
+                        if not id_produto:
+                            continue
+                    else:
+                        return
+
+            # Pergunta quantidade
+            try:
+                quantidade = int(input("Quantidade desejada: ").strip())
+                if quantidade <= 0:
+                    print("Quantidade deve ser maior que zero.")
+                    continue
+            except ValueError:
+                print("Quantidade inválida.")
+                continue
+
+            # Tenta decrementar estoque (os commits serão feitos ao final)
+            if not db_postgres.decrementar_estoque(conn_pg, id_produto, quantidade):
+                print("Não foi possível reservar a quantidade solicitada. Tente outro produto ou ajuste a quantidade.")
+                if input("Deseja tentar outro produto? (S/N): ").strip().upper() == 'S':
+                    continue
+                else:
+                    conn_pg.rollback()
+                    return
+
+            compras_pendente.append((id_produto, quantidade))
+
+            if input("Deseja adicionar outro produto? (S/N): ").strip().upper() != 'S':
+                break
+
+        # Grava todas as compras e commita uma vez
+        try:
+            for pid, qty in compras_pendente:
+                for _ in range(qty):
+                    cursor.execute("INSERT INTO Compras (id_cliente, id_produto) VALUES (%s, %s)", (id_cliente, pid))
+            conn_pg.commit()
             print(f"✅ Estoque atualizado e Compra registrada no Postgres.")
-            
-        else:
-            print("🚫 Venda Cancelada: Não foi possível atualizar o estoque.")
-            return # Sai da função, não faz o resto
+        except Exception as e:
+            print(f"❌ Erro ao registrar compra: {e}")
+            conn_pg.rollback()
+            return
 
         # =========================================================
 
@@ -270,19 +326,83 @@ def menu():
         print("3. Mongo (Interesses)")
         print("4. Redis (Cache/Consulta)")
         print("-" * 30)
-        print("5. REALIZAR COMPRA (Grava nas Bases 1, 2, 3)")
-        print("6. GERAR RECOMENDAÇÕES (Lê 1, 2, 3 -> Grava na 4)")
+        print("5. REALIZAR COMPRA")
+        print("6. GERAR RECOMENDAÇÕES")
+        print("7. Cadastrar Cliente")
+        print("8. Cadastrar Produto")
+        print("9. Listar Compras")
+        print("10. Limpar Dados (PG, Neo4j, Mongo, Redis)")
         print("0. Sair")
         
         op = input("Opção: ")
-        if op == '1': db_postgres.menu()
-        elif op == '2': db_neo4j.menu_grafo()
-        elif op == '3': db_mongo.menu_mongo()
-        elif op == '4': db_redis.menu_redis()
-        elif op == '5': fluxo_compra_integrada()
-        elif op == '6': gerar_recomendacoes_redis()
-        elif op == '0': sys.exit()
-        else: print("Inválido.")
+        if op == '1':
+            db_postgres.menu()
+        elif op == '2':
+            db_neo4j.menu_grafo()
+        elif op == '3':
+            db_mongo.menu_mongo()
+        elif op == '4':
+            db_redis.menu_redis()
+        elif op == '5':
+            fluxo_compra_integrada()
+        elif op == '6':
+            gerar_recomendacoes_redis()
+        elif op == '7':
+            conn = db_postgres.conectar()
+            if conn:
+                db_postgres.criar_cliente(conn)
+                conn.close()
+            else:
+                print("Não foi possível conectar ao Postgres.")
+        elif op == '8':
+            conn = db_postgres.conectar()
+            if conn:
+                db_postgres.criar_produto(conn)
+                conn.close()
+            else:
+                print("Não foi possível conectar ao Postgres.")
+        elif op == '9':
+            conn = db_postgres.conectar()
+            if conn:
+                db_postgres.listar_compras(conn)
+                conn.close()
+            else:
+                print("Não foi possível conectar ao Postgres.")
+        elif op == '10':
+            confirm = input("ATENÇÃO: Isso removerá TODOS os dados das 4 bases. Continuar? (S/N): ").strip().upper()
+            if confirm != 'S':
+                print("Operação de limpeza cancelada.")
+                continue
+
+            # Postgres
+            try:
+                db_postgres.limpar_dados_postgres()
+            except Exception as e:
+                print(f"Erro limpando Postgres: {e}")
+
+            # Neo4j
+            try:
+                db_neo4j.limpar_grafo()
+            except Exception as e:
+                print(f"Erro limpando Neo4j: {e}")
+
+            # MongoDB
+            try:
+                db_mongo.limpar_dados_mongo()
+            except Exception as e:
+                print(f"Erro limpando MongoDB: {e}")
+
+            # Redis
+            try:
+                db_redis.limpar_dados_redis()
+            except Exception as e:
+                print(f"Erro limpando Redis: {e}")
+
+            print("\n🎯 Limpeza concluída (se as conexões estavam disponíveis).")
+        elif op == '0':
+            sys.exit()
+        else:
+            print("Inválido.")
 
 if __name__ == "__main__":
     # A função verificar_tudo retorna True se TODOS estiverem on, 

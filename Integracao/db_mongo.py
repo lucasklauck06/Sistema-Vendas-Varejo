@@ -140,3 +140,19 @@ if __name__ == "__main__":
         menu_mongo()
     else:
         print("❌ Não foi possível conectar ao MongoDB.")
+
+
+def limpar_dados_mongo():
+    """Remove todos os documentos da coleção usada pelo projeto (não apaga o DB)."""
+    colecao, client = conectar_mongo()
+    if colecao is None:
+        print("❌ Não foi possível conectar ao Mongo para limpar dados.")
+        return
+
+    try:
+        colecao.delete_many({})
+        print("✅ Coleção do MongoDB limpa (todos os documentos removidos).")
+    except Exception as e:
+        print(f"❌ Erro ao limpar MongoDB: {e}")
+    finally:
+        if client: client.close()

@@ -38,8 +38,7 @@ class GrafoDB:
             query = """
             MATCH (p1:Pessoa {cpf: $cpf1})
             MATCH (p2:Pessoa {cpf: $cpf2})
-            MERGE (p1)-[:AMIGO_DE]->(p2)
-            MERGE (p2)-[:AMIGO_DE]->(p1)  
+            MERGE (p1)-[:AMIGO_DE]-(p2)
             RETURN p1.nome, p2.nome
             """
             result = session.run(query, cpf1=cpf_cliente, cpf2=cpf_amigo)
@@ -53,7 +52,7 @@ class GrafoDB:
         with self.driver.session() as session:
             query = """
             MATCH (p:Pessoa {cpf: $cpf})-[:AMIGO_DE]-(amigo)
-            RETURN amigo.nome, amigo.cpf
+            RETURN DISTINCT amigo.nome, amigo.cpf
             """
             result = session.run(query, cpf=cpf)
             amigos = [record for record in result]
@@ -113,3 +112,15 @@ if __name__ == "__main__":
         menu_grafo()
     except Exception as e:
         print(f"Erro de conexão: {e}")
+
+
+def limpar_grafo():
+    """Remove todos os nós e relacionamentos do grafo (não apaga o banco)."""
+    try:
+        db = GrafoDB(URI, AUTH)
+        with db.driver.session() as session:
+            session.run("MATCH (n) DETACH DELETE n")
+        db.close()
+        print("✅ Grafo Neo4j limpo (nós e relacionamentos removidos).")
+    except Exception as e:
+        print(f"❌ Erro ao limpar Neo4j: {e}")

@@ -163,21 +163,102 @@ def listar_produtos(conn):
 # ==========================================
 def realizar_compra(conn):
     print("\n--- Nova Compra ---")
-    listar_clientes(conn)
-    id_cliente = input("Digite o ID do Cliente: ")
-    
-    listar_produtos(conn)
-    id_produto = input("Digite o ID do Produto: ")
-
+    # Verifica se há clientes na base; se não houver, oferece cadastrar na hora
     try:
         cursor = conn.cursor()
-        # Insere a compra usando a data padrão (DEFAULT CURRENT_TIMESTAMP) do banco
+        cursor.execute("SELECT COUNT(*) FROM Clientes;")
+        total_clientes = cursor.fetchone()[0]
+    except Error as e:
+        print(f"❌ Erro ao verificar clientes: {e}")
+        return
+
+    id_cliente = None
+    if total_clientes == 0:
+        escolha = input("Nenhum cliente encontrado. Deseja cadastrar agora? (S/N): ").strip().upper()
+        if escolha == 'S':
+            id_cliente = criar_cliente(conn)
+            if not id_cliente:
+                return
+        else:
+            print("Operação cancelada.")
+            return
+    else:
+        # Mostra a lista somente se houver clientes (evita mensagem duplicada)
+        listar_clientes(conn)
+        entrada = input("Digite o ID do Cliente (ou 'N' para cadastrar novo): ")
+        if entrada.strip().upper() == 'N':
+            id_cliente = criar_cliente(conn)
+            if not id_cliente: return
+        else:
+            id_cliente = entrada
+            try:
+                cursor.execute("SELECT id FROM Clientes WHERE id = %s", (id_cliente,))
+                if not cursor.fetchone():
+                    print(f"⚠️ Cliente {id_cliente} não encontrado.")
+                    if input("Cadastrar agora? (S/N): ").strip().upper() == 'S':
+                        id_cliente = criar_cliente(conn)
+                        if not id_cliente: return
+                    else:
+                        return
+            except Error as e:
+                print(f"❌ Erro ao verificar cliente: {e}")
+                return
+
+    # Permite adicionar múltiplos produtos com quantidade
+    compras_realizadas = []  # lista de (id_produto, quantidade)
+
+    while True:
+        listar_produtos(conn)
+        entrada_prod = input("Digite o ID do Produto (ou 'N' para novo): ")
+        if entrada_prod.strip().upper() == 'N':
+            id_produto = criar_produto(conn)
+            if not id_produto:
+                # se falhou cadastro, volta ao início
+                continue
+        else:
+            id_produto = entrada_prod
+
+        try:
+            quantidade = int(input("Quantidade desejada: ").strip())
+            if quantidade <= 0:
+                print("Quantidade deve ser maior que zero.")
+                continue
+        except ValueError:
+            print("Quantidade inválida.")
+            continue
+
+        # Tenta decrementar estoque (não comita ainda)
+        if not decrementar_estoque(conn, id_produto, quantidade):
+            print("Não foi possível reservar o produto. Tente outro ou verifique o estoque.")
+            if input("Deseja tentar outro produto? (S/N): ").strip().upper() == 'S':
+                continue
+            else:
+                try:
+                    conn.rollback()
+                except: pass
+                print("Operação cancelada.")
+                return
+
+        compras_realizadas.append((id_produto, quantidade))
+
+        mais = input("Deseja adicionar outro produto? (S/N): ").strip().upper()
+        if mais != 'S':
+            break
+
+    # Inserir registros de compra e commitar uma vez
+    try:
+        cursor = conn.cursor()
         sql = "INSERT INTO Compras (id_cliente, id_produto) VALUES (%s, %s);"
-        cursor.execute(sql, (id_cliente, id_produto))
+        for pid, qty in compras_realizadas:
+            for _ in range(qty):
+                cursor.execute(sql, (id_cliente, pid))
         conn.commit()
         print("✅ Compra registrada com sucesso!")
     except Error as e:
         print(f"❌ Erro ao registrar compra: {e}")
+        try:
+            conn.rollback()
+        except: pass
 
 def listar_compras(conn):
     print("\n--- Relatório de Compras ---")
@@ -219,33 +300,34 @@ def buscar_compras_por_cliente(conn, id_cliente):
         return []
     
 
-def decrementar_estoque(conn, id_produto):
+def decrementar_estoque(conn, id_produto, quantidade=1):
     """
-    Verifica se há estoque e decrementa 1 unidade.
-    Retorna True se conseguiu, False se não há estoque.
+    Verifica se há estoque suficiente e decrementa `quantidade` unidades.
+    Retorna True se conseguiu, False caso contrário.
     """
     try:
         cursor = conn.cursor()
-        
+
         # 1. Verifica a quantidade atual
         cursor.execute("SELECT quantidade FROM Produtos WHERE id = %s", (id_produto,))
         resultado = cursor.fetchone()
-        
+
         if not resultado:
-            return False # Produto não existe
-            
+            print("⚠️ ERRO: Produto não existe.")
+            return False
+
         qtd_atual = resultado[0]
-        
-        if qtd_atual > 0:
-            # 2. Atualiza o banco (Decrementa)
-            sql_update = "UPDATE Produtos SET quantidade = quantidade - 1 WHERE id = %s"
-            cursor.execute(sql_update, (id_produto,))
-            # Nota: O commit será feito no main.py junto com a compra para garantir integridade
+
+        if qtd_atual >= quantidade and quantidade > 0:
+            # 2. Atualiza o banco (Decrementa em lote)
+            sql_update = "UPDATE Produtos SET quantidade = quantidade - %s WHERE id = %s"
+            cursor.execute(sql_update, (quantidade, id_produto))
+            # Nota: O commit será feito pelo chamador para garantir integridade
             return True
         else:
-            print("⚠️ ERRO: Produto esgotado (Estoque zerado)!")
+            print(f"⚠️ ERRO: Estoque insuficiente. Disponível: {qtd_atual}, solicitado: {quantidade}.")
             return False
-            
+
     except Error as e:
         print(f"❌ Erro ao atualizar estoque: {e}")
         return False
@@ -290,6 +372,28 @@ def menu():
             print("Opção inválida!")
 
     conn.close()
+
+
+def limpar_dados_postgres():
+    """Limpa dados das tabelas Clientes, Produtos e Compras (não apaga o banco)."""
+    conn = conectar()
+    if not conn:
+        print("❌ Não foi possível conectar ao Postgres para limpar dados.")
+        return
+
+    try:
+        cursor = conn.cursor()
+        # TRUNCATE com RESTART IDENTITY para zerar sequências
+        cursor.execute("TRUNCATE TABLE Compras, Produtos, Clientes RESTART IDENTITY CASCADE;")
+        conn.commit()
+        print("✅ Dados do Postgres limpos (Clientes, Produtos, Compras).")
+    except Error as e:
+        print(f"❌ Erro ao limpar dados do Postgres: {e}")
+        try:
+            conn.rollback()
+        except: pass
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     menu()
